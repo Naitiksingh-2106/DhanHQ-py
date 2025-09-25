@@ -1,0 +1,194 @@
+"""
+50pct_midpoint_scanner.py
+
+Professional, well-documented Python script to identify stocks that are trading near the 50% point
+between their daily high and low (i.e., the midpoint of the day's range).
+
+Features:
+- Accepts a list of tickers (file or CLI) or reads from a sample list.
+- Uses yfinance to fetch today's high, low and latest price.
+- Computes the midpoint and reports tickers whose current price is within a given tolerance
+  (percentage of the day's range) around the midpoint.
+- Outputs results to console and to a CSV file.
+- Easy to adapt for scheduled runs / GitHub Actions.
+
+Requirements:
+- Python 3.9+
+- pip install yfinance pandas python-dateutil
+
+Usage examples:
+- python 50pct_midpoint_scanner.py --tickers AAPL MSFT GOOGL
+- python 50pct_midpoint_scanner.py --tickers-file tickers.txt --tolerance 1.5
+
+Notes:
+- This script fetches market data via yfinance. Live intraday accuracy depends on your data provider
+  and market hours. Use an exchange/API of your choice if you need guaranteed real-time data.
+- Adjust 'tolerance' (percent of daily range) to control how close to midpoint you want.
+
+"""
+
+import argparse
+import csv
+import sys
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+
+import pandas as pd
+import yfinance as yf
+
+
+def fetch_daily_data(ticker: str) -> Optional[Dict]:
+    """Fetches today's high, low and latest price for the given ticker using yfinance.
+
+    Returns a dictionary with keys: ticker, high, low, last, midpoint, range_width, timestamp
+    or None if data is unavailable.
+    """
+    try:
+        tk = yf.Ticker(ticker)
+        # Attempt to get intraday (today) history. If market closed, take last available day.
+        now = datetime.utcnow()
+        start = now - timedelta(days=3)
+        hist = tk.history(start=start.strftime("%Y-%m-%d"), interval="1m")
+
+        if hist.empty:
+            # Fallback: use fast info / regular market price
+            info = tk.fast_info if hasattr(tk, 'fast_info') else tk.info
+            last = info.get('lastPrice') or info.get('regularMarketPrice')
+            day_high = info.get('dayHigh')
+            day_low = info.get('dayLow')
+            if not all([last, day_high, day_low]):
+                return None
+            timestamp = datetime.utcnow()
+        else:
+            # Use today's rows only (based on local tz in index)
+            hist = hist.dropna()
+            # If multiple days present, take most recent day
+            last_day = hist.index.normalize()[-1]
+            today_rows = hist[hist.index.normalize() == last_day]
+            day_high = today_rows['High'].max()
+            day_low = today_rows['Low'].min()
+            last = today_rows['Close'][-1]
+            timestamp = today_rows.index[-1].to_pydatetime()
+
+        if day_high is None or day_low is None or last is None:
+            return None
+
+        midpoint = (day_high + day_low) / 2.0
+        range_width = day_high - day_low
+
+        return {
+            'ticker': ticker,
+            'high': float(day_high),
+            'low': float(day_low),
+            'last': float(last),
+            'midpoint': float(midpoint),
+            'range_width': float(range_width),
+            'timestamp': timestamp,
+        }
+
+    except Exception as e:
+        print(f"Error fetching {ticker}: {e}", file=sys.stderr)
+        return None
+
+
+def is_near_midpoint(data: Dict, tolerance_pct: float) -> Optional[Dict]:
+    """Returns a result dict if 'last' is within tolerance_pct of midpoint relative to the day's range.
+
+    tolerance_pct is expressed as a percent of the day's range. For example, tolerance_pct=1.0
+    means within +/-1% of the full daily range around the midpoint.
+
+    If the day's range is zero (no movement), returns None.
+    """
+    if data is None:
+        return None
+
+    range_width = data['range_width']
+    if range_width == 0:
+        return None
+
+    midpoint = data['midpoint']
+    last = data['last']
+    diff = abs(last - midpoint)
+
+    # tolerance in absolute price
+    tolerance_abs = (tolerance_pct / 100.0) * range_width
+
+    within = diff <= tolerance_abs
+    pct_from_midpoint_of_range = (diff / range_width) * 100.0
+
+    return {
+        'ticker': data['ticker'],
+        'high': data['high'],
+        'low': data['low'],
+        'last': data['last'],
+        'midpoint': midpoint,
+        'range_width': range_width,
+        'diff': diff,
+        'pct_from_midpoint_of_range': pct_from_midpoint_of_range,
+        'within_tolerance': within,
+        'timestamp': data['timestamp'],
+    }
+
+
+def scan_tickers(tickers: List[str], tolerance_pct: float) -> pd.DataFrame:
+    """Scans given tickers and returns a DataFrame of tickers near midpoint."""
+    results = []
+    for t in tickers:
+        t = t.strip().upper()
+        if not t:
+            continue
+        data = fetch_daily_data(t)
+        res = is_near_midpoint(data, tolerance_pct)
+        if res and res['within_tolerance']:
+            results.append(res)
+
+    df = pd.DataFrame(results)
+    if not df.empty:
+        # Sort by how close to midpoint (smallest pct_from_midpoint_of_range first)
+        df = df.sort_values(by='pct_from_midpoint_of_range')
+    return df
+
+
+def load_tickers_from_file(path: str) -> List[str]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+
+def save_to_csv(df: pd.DataFrame, out_path: str):
+    df.to_csv(out_path, index=False, float_format='%.6f')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Scan tickers for prices near the daily midpoint (50%).')
+    parser.add_argument('--tickers', nargs='*', help='List of tickers to scan (e.g. AAPL MSFT GOOGL)')
+    parser.add_argument('--tickers-file', help='Path to a file containing tickers (one per line)')
+    parser.add_argument('--tolerance', type=float, default=1.0,
+                        help='Tolerance in percent of daily range around midpoint (default=1.0)')
+    parser.add_argument('--output', default='midpoint_hits.csv', help='Output CSV file path')
+
+    args = parser.parse_args()
+
+    tickers = []
+    if args.tickers:
+        tickers.extend(args.tickers)
+    if args.tickers_file:
+        tickers_from_file = load_tickers_from_file(args.tickers_file)
+        tickers.extend(tickers_from_file)
+
+    if not tickers:
+        # default sample list
+        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+
+    df = scan_tickers(tickers, args.tolerance)
+
+    if df.empty:
+        print('No tickers found near the midpoint with the given tolerance.')
+    else:
+        print(f"Found {len(df)} ticker(s) near midpoint. Saving to {args.output}")
+        save_to_csv(df, args.output)
+        # print a short table to console
+        print(df[['ticker', 'last', 'midpoint', 'pct_from_midpoint_of_range']].to_string(index=False))
+
+
+if __name__ == '__main__':
+    main()
